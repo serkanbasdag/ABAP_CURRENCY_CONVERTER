@@ -1,0 +1,544 @@
+REPORT ZSERKAN_P_CURRENCY.
+
+TYPE-POOLS: IXML,VRM.
+
+DATA : URI TYPE STRING.  "web sayfa adresi
+
+DATA: HTTP_CLIENT    TYPE REF TO IF_HTTP_CLIENT,
+      V_RESPONSE     TYPE STRING,
+      LEN            TYPE I,
+      OFSET          TYPE I,
+      LXDATA         TYPE I,
+      XDATA          TYPE XSTRING,
+      BUFFER         TYPE XSTRING,
+      XSLT_ERR       TYPE REF TO CX_XSLT_EXCEPTION,
+      STATUS         TYPE I,                  " programın işleyiş durumu
+      STATXT(100)    TYPE C,                   " durum metni
+      XMLSTR         TYPE STRING,
+      FNAME          TYPE STRING,
+      GUN(2),
+      AY(2),
+      YIL(4),
+      GV_FIRST_TIME,
+      GV_NODETEXT    TYPE STRING,
+      GV_NODE        TYPE REF TO IF_IXML_NODE,
+      KURTARIH(10)   TYPE C,
+      PARA_BIRIMI(3) TYPE C.
+*-------------------------------------------------------------------------------------------------------------------
+*İnternal tablolar
+*-------------------------------------------------------------------------------------------------------------------
+DATA : BEGIN OF ITAB OCCURS 0,
+         TARIH(10)          ,
+         KOD(3)             ,
+         CURRENCYCODE(3)    ,
+         UNIT(5)            ,
+         ISIM(30)           ,
+         CURRENCYNAME(30)   ,
+         FOREXBUYING(15)    ,
+         FOREXSELLING(15)   ,
+         BANKNOTEBUYING(15) ,
+         BANKNOTESELLING(15),
+         CROSSRATEUSD(10)   ,
+         CROSSRATEOTHER(10) ,
+         CROSSRATEEURO(10)  ,
+       END OF ITAB.
+
+DATA: GV_CUSTOM_CONTAINER TYPE REF TO CL_GUI_CUSTOM_CONTAINER,
+      GV_GRID             TYPE REF TO CL_GUI_ALV_GRID,
+      GT_ITAB             LIKE TABLE OF VBAP WITH HEADER LINE,
+      GT_FCAT             TYPE LVC_T_FCAT.
+
+DATA: IT_SON LIKE ZSB_T_CURRENCY OCCURS 0 WITH HEADER LINE,
+      WA_SON LIKE LINE OF IT_SON.
+
+DATA: LD_FIELD1 TYPE VRM_ID,
+      IT_BIRIM1 TYPE VRM_VALUES,
+      WA_BIRIM1 LIKE LINE OF IT_BIRIM1,
+      LD_FIELD2 TYPE VRM_ID,
+      IT_BIRIM2 TYPE VRM_VALUES,
+      WA_BIRIM2 LIKE LINE OF IT_BIRIM2.
+
+
+DATA: IT_VALUES TYPE TABLE OF DYNPREAD,
+      WA_VALUES TYPE DYNPREAD.
+
+
+DATA: B1 LIKE ZSB_T_CURRENCY-KOD,
+      B2 LIKE ZSB_T_CURRENCY-KOD.
+DATA: SAYI1 LIKE ZSB_T_SAYI-SAYI1,
+      SAYI2 LIKE ZSB_T_SAYI-SAYI2.
+
+*-------------------------------------------------------------------------------------------------------------------
+
+*-------------------------------------------------------------------------------------------------------------------
+*tarih parametresi
+*-------------------------------------------------------------------------------------------------------------------
+SELECTION-SCREEN BEGIN OF BLOCK A1 WITH FRAME TITLE TEXT-001.
+PARAMETERS KURTRH TYPE DATUM.
+SELECTION-SCREEN END OF BLOCK A1.
+*-------------------------------------------------------------------------------------------------------------------
+
+*-------------------------------------------------------------------------------------------------------------------
+*tarihin boş olmaması için kontrol
+*-------------------------------------------------------------------------------------------------------------------
+IF KURTRH IS INITIAL.          "tarih boş girilimez
+  MESSAGE 'Lütfen bir tarih seçiniz' TYPE 'I' DISPLAY LIKE 'E'.
+  CLEAR: ITAB, IT_SON, HTTP_CLIENT.
+  EXIT.
+ENDIF.
+
+DATA: SAAT TYPE UZEIT.
+SAAT = '153000'.
+IF KURTRH EQ SY-DATUM.         "merkez bankası kurları 15:30 da güncelleniyor
+  IF SY-UZEIT < SAAT.
+    MESSAGE 'Bugünün kurlarını çekebilmek için lütfen saat 15:30 u bekleyin' TYPE 'I' DISPLAY LIKE 'E'.
+    CLEAR: ITAB, IT_SON, HTTP_CLIENT.
+    EXIT.
+  ENDIF.
+ENDIF.
+
+IF KURTRH > SY-DATUM.           "bir sonraki günün kurları görülemez
+  MESSAGE 'ileri tarihe kur tarihi seçemezsiniz!!!' TYPE 'I' DISPLAY LIKE 'E'.
+  CLEAR: ITAB, IT_SON, HTTP_CLIENT.
+  EXIT.
+ENDIF.
+CLEAR: ITAB, IT_SON, HTTP_CLIENT.
+PERFORM GET_DOVKUR.
+PERFORM PARSE_XML_DATA.
+
+LOOP AT ITAB
+  WHERE KOD EQ 'USD' OR
+  KOD EQ 'AUD' OR
+  KOD EQ 'DKK' OR
+  KOD EQ 'EUR' OR
+  KOD EQ 'GBP' OR
+  KOD EQ 'CHF' OR
+  KOD EQ 'SEK' OR
+  KOD EQ 'CAD' OR
+  KOD EQ 'KWD' OR
+  KOD EQ 'NOK' OR
+  KOD EQ 'SAR' OR
+  KOD EQ 'JPY' OR
+  KOD EQ 'BGN' OR
+  KOD EQ 'RON' OR
+  KOD EQ 'RUB' OR
+  KOD EQ 'IRR' OR
+  KOD EQ 'CNY' OR
+  KOD EQ 'PKR' OR
+  KOD EQ 'QAR'.
+  IT_SON-TARIH = ITAB-TARIH.
+  IT_SON-KOD   = ITAB-KOD.
+  IT_SON-FOREXBUYING = ITAB-FOREXBUYING.
+  IT_SON-FOREXSELLING = ITAB-FOREXSELLING.
+  APPEND IT_SON.
+  MODIFY ZSB_T_CURRENCY FROM IT_SON.
+ENDLOOP.
+
+
+IF SY-SUBRC EQ 0.
+  MESSAGE 'Kurlar Başarıyla Güncellendi' TYPE 'I' DISPLAY LIKE 'S'.
+  CALL SCREEN 0100.
+ELSE.
+  MESSAGE 'Seçtiğiniz gün pazar veya cumartesi günlerinden biri olabilir lütfen kontol ediniz.' TYPE 'I' DISPLAY LIKE 'E'.
+  CLEAR: ITAB, IT_SON, HTTP_CLIENT.
+ENDIF.
+CLEAR: ITAB, IT_SON, HTTP_CLIENT.
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_DOVKUR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+
+FORM GET_DOVKUR .
+  YIL    = KURTRH(4).
+  AY     =  KURTRH+4(2).
+  GUN    = KURTRH+6(2).
+  CONCATENATE GUN AY YIL '.xml' INTO FNAME.
+  CONCATENATE 'http://www.tcmb.gov.tr/kurlar/' YIL AY '/' FNAME INTO URI.
+  CALL METHOD CL_HTTP_CLIENT=>CREATE_BY_URL
+    EXPORTING
+      URL                = URI
+*     PROXY_HOST         = '10.2.3.220' "eğer sistemin internete çıkışı kapalıysa verilmelidir
+*     PROXY_SERVICE      = '8080'
+*     SSL_ID             = ''
+*     SAP_USERNAME       =
+    IMPORTING
+      CLIENT             = HTTP_CLIENT
+    EXCEPTIONS
+      ARGUMENT_NOT_FOUND = 1
+      PLUGIN_NOT_ACTIVE  = 2
+      INTERNAL_ERROR     = 3
+      OTHERS             = 4.
+
+  IF SY-SUBRC <> 0.
+    STATXT = 'http_client oluşturma hatası!'.
+    STATUS = 2.
+    EXIT.
+  ENDIF.
+
+  CALL METHOD HTTP_CLIENT->SEND
+    EXCEPTIONS
+      HTTP_COMMUNICATION_FAILURE = 1
+      HTTP_INVALID_STATE         = 2.
+
+  IF SY-SUBRC <> 0.
+    STATXT = 'http_client istek gönderemedi!'.
+    STATUS = 2.
+    EXIT.
+  ENDIF.
+
+*  receive response
+  CALL METHOD HTTP_CLIENT->RECEIVE
+    EXCEPTIONS
+      HTTP_COMMUNICATION_FAILURE = 1
+      HTTP_INVALID_STATE         = 2
+      HTTP_PROCESSING_FAILED     = 3.
+
+  IF SY-SUBRC <> 0.
+    STATXT =  'http_client veri alamadı!'.
+    STATUS = 2.
+    EXIT.
+  ENDIF.
+
+*  get response as character data
+  XMLSTR = HTTP_CLIENT->RESPONSE->GET_CDATA( ).
+
+  IF XMLSTR IS INITIAL.
+    STATUS = 2.
+    STATXT = 'Merkez bankasından gelen verinin içi boş!'.
+    EXIT.
+  ENDIF.
+ENDFORM.                    " GET_DOVKUR
+*&---------------------------------------------------------------------*
+*&      Form  PARSE_XML_DATA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM PARSE_XML_DATA .
+  CHECK STATUS IS INITIAL.
+
+  CLASS CL_IXML DEFINITION LOAD.
+
+  DATA: G_IXML TYPE REF TO IF_IXML.
+  DATA: STREAMFACTORY TYPE REF TO IF_IXML_STREAM_FACTORY.
+  DATA: ISTREAM TYPE REF TO IF_IXML_ISTREAM.
+  DATA: DOCUMENT TYPE REF TO IF_IXML_DOCUMENT.
+  DATA: PARSER TYPE REF TO IF_IXML_PARSER.
+
+  G_IXML = CL_IXML=>CREATE( ).
+
+* Now Create Stream Factory
+  STREAMFACTORY = G_IXML->CREATE_STREAM_FACTORY( ).
+
+* wrap the table containing the file into a stream
+  ISTREAM = STREAMFACTORY->CREATE_ISTREAM_STRING( STRING = XMLSTR ) .
+
+* Create XML Document instance
+  DOCUMENT = G_IXML->CREATE_DOCUMENT( ).
+
+* Create parser Object
+  PARSER = G_IXML->CREATE_PARSER( STREAM_FACTORY = STREAMFACTORY
+                                  ISTREAM = ISTREAM
+                                  DOCUMENT = DOCUMENT ).
+
+* Parse an XML document into a DOM tree
+
+* Parsing Error Processing
+  IF PARSER->PARSE( ) NE 0.
+    IF PARSER->NUM_ERRORS( ) NE 0.
+      IF XMLSTR IS INITIAL.
+        STATUS = 2.
+        STATXT = TEXT-208.
+        EXIT.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+* Close the stream since it ï¿½s not needed anymore
+  CALL METHOD ISTREAM->CLOSE( ).
+  CLEAR ISTREAM.
+
+  GV_FIRST_TIME = 'X'.
+  GV_NODE = DOCUMENT.
+
+  PERFORM CREATE_DATATABLE TABLES ITAB
+                            USING GV_NODE.
+
+  IF LINES( ITAB ) EQ 0.
+    STATUS = 3.
+    STATXT = TEXT-207.
+  ELSE.
+* Last item is still not added.
+    ITAB-TARIH = KURTARIH.
+    APPEND ITAB.
+  ENDIF.
+ENDFORM.                    " PARSE_XML_DATA
+*&---------------------------------------------------------------------*
+*&      Form  create_datatable
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->YT_ITEM        text
+*      -->VALUE(X_NODE)  text
+*----------------------------------------------------------------------*
+FORM CREATE_DATATABLE TABLES   YT_ITEM    STRUCTURE ITAB
+                      USING VALUE(X_NODE) TYPE REF TO IF_IXML_NODE.
+
+  CHECK STATUS IS INITIAL.
+
+  DATA: INDENT      TYPE I.
+  DATA: PTEXT       TYPE REF TO IF_IXML_TEXT.
+  DATA: STRING      TYPE STRING.
+  DATA: TEMP_STRING(100).
+  DATA: NTIPI TYPE I.
+  DATA: NADI TYPE STRING.
+  DATA: NVAL TYPE STRING.
+  DATA: NODE2 TYPE REF TO IF_IXML_NODE.
+  DATA: ATTRIBUTES TYPE REF TO IF_IXML_NAMED_NODE_MAP.
+
+  NTIPI = X_NODE->GET_TYPE( ).
+  NADI  = X_NODE->GET_NAME( ).
+  NVAL  = X_NODE->GET_VALUE( ).
+
+  CASE X_NODE->GET_TYPE( ).
+    WHEN IF_IXML_NODE=>CO_NODE_ELEMENT.
+      STRING = X_NODE->GET_NAME( ).
+      GV_NODETEXT = STRING.
+      IF GV_NODETEXT EQ 'Tarih_Date'.
+        ATTRIBUTES = X_NODE->GET_ATTRIBUTES( ).
+
+        CALL METHOD ATTRIBUTES->GET_NAMED_ITEM
+          EXPORTING
+            NAME = 'Tarih'
+*           NAMESPACE = ''
+          RECEIVING
+            RVAL = NODE2.
+        STRING = NODE2->GET_VALUE( ).
+        MOVE STRING TO KURTARIH.
+
+      ELSEIF GV_NODETEXT EQ 'Currency'.
+        IF GV_FIRST_TIME NE 'X'.
+          ITAB-TARIH = KURTARIH.
+          APPEND ITAB.
+          CLEAR : ITAB.
+        ENDIF.
+        GV_FIRST_TIME = ' '.
+
+        ATTRIBUTES = X_NODE->GET_ATTRIBUTES( ).
+
+        CALL METHOD ATTRIBUTES->GET_NAMED_ITEM
+          EXPORTING
+            NAME = 'Kod'
+          RECEIVING
+            RVAL = NODE2.
+        STRING = NODE2->GET_VALUE( ).
+        MOVE STRING TO ITAB-KOD.
+
+        CALL METHOD ATTRIBUTES->GET_NAMED_ITEM
+          EXPORTING
+            NAME = 'CurrencyCode'
+          RECEIVING
+            RVAL = NODE2.
+        STRING = NODE2->GET_VALUE( ).
+        MOVE STRING TO ITAB-CURRENCYCODE.
+      ENDIF.
+
+    WHEN IF_IXML_NODE=>CO_NODE_TEXT.
+      PTEXT ?= X_NODE->QUERY_INTERFACE( IXML_IID_TEXT ).
+      IF PTEXT->WS_ONLY( ) IS INITIAL.
+        STRING = X_NODE->GET_VALUE( ).
+
+        CASE GV_NODETEXT.
+          WHEN 'Kod'.
+            MOVE STRING TO ITAB-KOD.
+
+          WHEN 'CurrencyCode'.
+            MOVE STRING TO ITAB-CURRENCYCODE.
+
+          WHEN 'Unit'.
+            MOVE STRING TO ITAB-UNIT.
+
+          WHEN 'Isim'.
+            MOVE STRING TO ITAB-ISIM.
+
+          WHEN 'CurrencyName'.
+            MOVE STRING TO ITAB-CURRENCYNAME.
+
+          WHEN 'ForexBuying'.
+            MOVE STRING TO ITAB-FOREXBUYING.
+
+          WHEN 'ForexSelling'.
+            MOVE STRING TO ITAB-FOREXSELLING.
+
+          WHEN 'BanknoteBuying'.
+            MOVE STRING TO ITAB-BANKNOTEBUYING.
+
+          WHEN 'BanknoteSelling'.
+            MOVE STRING TO ITAB-BANKNOTESELLING.
+
+          WHEN 'CrossRateUSD'.
+            MOVE STRING TO ITAB-CROSSRATEUSD.
+
+          WHEN 'CrossRateOther'.
+            MOVE STRING TO ITAB-CROSSRATEOTHER.
+
+          WHEN 'CrossRateEuro'.
+            MOVE STRING TO ITAB-CROSSRATEEURO.
+
+        ENDCASE.
+
+      ENDIF.
+  ENDCASE.
+
+* Get the next child
+  X_NODE = X_NODE->GET_FIRST_CHILD( ).
+* Recurse
+  WHILE NOT X_NODE IS INITIAL.
+
+    PERFORM CREATE_DATATABLE TABLES ITAB
+                              USING X_NODE.
+    X_NODE = X_NODE->GET_NEXT( ).
+  ENDWHILE.
+
+ENDFORM.                    "get_datatable
+*&---------------------------------------------------------------------*
+*&      Module  STATUS_0100  OUTPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE STATUS_0100 OUTPUT.
+  SET PF-STATUS 'PF'.
+  SET TITLEBAR 'TITLE'.
+
+  PERFORM DISPLAY.
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0100  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE USER_COMMAND_0100 INPUT.
+  CASE SY-UCOMM.
+    WHEN 'BACK' OR 'CANCEL' OR 'EXIT'.
+      LEAVE TO SCREEN 0.
+    WHEN 'BTN_DONS'.
+      PERFORM DONUSTUR.
+  ENDCASE.
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Form  DISPLAY
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM DISPLAY .
+
+  IF GV_CUSTOM_CONTAINER IS INITIAL .
+    CREATE OBJECT GV_CUSTOM_CONTAINER
+      EXPORTING
+        CONTAINER_NAME = 'CONT'.
+    CREATE OBJECT GV_GRID
+      EXPORTING
+        I_PARENT = GV_CUSTOM_CONTAINER.
+    CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+      EXPORTING
+        I_STRUCTURE_NAME       = 'ZSB_T_CURRENCY'
+      CHANGING
+        CT_FIELDCAT            = GT_FCAT
+      EXCEPTIONS
+        INCONSISTENT_INTERFACE = 1
+        PROGRAM_ERROR          = 2
+        OTHERS                 = 3.
+
+*      SELECT * FROM ZSB_T_CURRENCY INTO CORRESPONDING FIELDS OF TABLE
+*        it_son.
+
+    CALL METHOD GV_GRID->SET_TABLE_FOR_FIRST_DISPLAY
+      EXPORTING
+        I_SAVE                        = 'A'
+      CHANGING
+        IT_OUTTAB                     = IT_SON[]
+        IT_FIELDCATALOG               = GT_FCAT[]
+      EXCEPTIONS
+        INVALID_PARAMETER_COMBINATION = 1
+        PROGRAM_ERROR                 = 2
+        TOO_MANY_LINES                = 3
+        OTHERS                        = 4.
+    IF SY-SUBRC <> 0.
+      MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+                 WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    ENDIF.
+  ENDIF.
+
+
+  CALL METHOD GV_GRID->CHECK_CHANGED_DATA.
+  CALL METHOD GV_GRID->REFRESH_TABLE_DISPLAY.
+
+  CALL METHOD GV_GRID->CHECK_CHANGED_DATA.
+
+  CALL METHOD CL_GUI_ALV_GRID=>SET_FOCUS
+    EXPORTING
+      CONTROL = GV_GRID.
+
+
+  LOOP AT IT_SON INTO WA_SON.
+    WA_BIRIM1-KEY = WA_SON-KOD.
+    WA_BIRIM1-TEXT = WA_SON-KOD.
+    WA_BIRIM2-KEY = WA_SON-KOD.
+    WA_BIRIM2-TEXT = WA_SON-KOD.
+    APPEND WA_BIRIM1 TO IT_BIRIM1.
+    APPEND WA_BIRIM2 TO IT_BIRIM2.
+    CLEAR WA_BIRIM1.
+    CLEAR WA_BIRIM2.
+  ENDLOOP.
+
+  LD_FIELD1 = 'B1'.
+  CALL FUNCTION 'VRM_SET_VALUES'
+    EXPORTING
+      ID     = LD_FIELD1
+      VALUES = IT_BIRIM1.
+
+  LD_FIELD2 = 'B2'.
+  CALL FUNCTION 'VRM_SET_VALUES'
+    EXPORTING
+      ID     = LD_FIELD2
+      VALUES = IT_BIRIM2.
+
+CLEAR: it_birim1,it_birim2,WA_BIRIM1,WA_BIRIM2.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  DONUSTUR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM DONUSTUR .
+
+  DATA: SONUC1(5) TYPE c,
+        SONUC2(5) TYPE c.
+
+
+  LOOP AT IT_SON INTO WA_SON.
+ IF WA_SON-KOD EQ B1.
+    SONUC1 = WA_SON-FOREXBUYING.
+  ENDIF.
+   IF WA_SON-KOD EQ B2.
+    SONUC2 = WA_SON-FOREXBUYING.
+  ENDIF.
+  ENDLOOP.
+
+  SAYI2 = ( SONUC1 / SONUC2 ) * SAYI1.
+
+ENDFORM.
